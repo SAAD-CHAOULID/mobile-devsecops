@@ -1,0 +1,24 @@
+services:
+  controller:
+    build: .
+    container_name: controller
+    ports:
+      - "8010:8010"
+    volumes:
+      - repos_storage:/repos_storage
+      - apk_storage:/apk_storage
+      - .:/app
+    env_file: .env
+    networks:
+      - pipeline_net
+    restart: unless-stopped
+
+volumes:
+  repos_storage:
+    external: true
+  apk_storage:
+    external: true
+
+networks:
+  pipeline_net:
+    external: true

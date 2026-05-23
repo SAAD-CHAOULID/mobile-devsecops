@@ -1,0 +1,9 @@
+cat ~/devsecops-v3/service_androguard/main.py
+cat ~/devsecops-v3/service_permissions/main.py
+cat ~/devsecops-v3/service_network/main.py
+cat ~/devsecops-v3/service_obfuscation/main.py
+cat ~/devsecops-v3/service_ssl/main.py
+cat ~/devsecops-v3/service_virustotal/main.py
+cat ~/devsecops-v3/service_syft/main.py
+cat ~/devsecops-v3/service_gitleaks/main.py
+cat ~/devsecops-v3/service_mobsf/main.py

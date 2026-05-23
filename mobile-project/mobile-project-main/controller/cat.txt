@@ -1,0 +1,2008 @@
+"""
+service_androguard — :8004
+Analyse statique du bytecode DEX Android.
+Détecte : APIs dangereuses, strings suspectes, fichiers embarqués, libs natives.
+"""
+import os, json, time, logging, zipfile, struct
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service Androguard", version="1.0.0")
+
+DANGEROUS_APIS = {
+    "critical": [
+        "Ljava/lang/Runtime;->exec(",
+        "Landroid/telephony/SmsManager;->sendTextMessage(",
+        "Ljava/lang/reflect/Method;->invoke(",
+        "Ldalvik/system/DexClassLoader;",
+    ],
+    "high": [
+        "Landroid/location/LocationManager;",
+        "Landroid/hardware/Camera;",
+        "Landroid/media/AudioRecord;",
+        "Ljavax/crypto/Cipher;",
+        "Landroid/webkit/WebView;->addJavascriptInterface(",
+    ],
+    "medium": [
+        "Ljava/net/URL;->openConnection(",
+        "Landroid/webkit/WebView;->loadUrl(",
+        "Ljava/io/FileOutputStream;",
+        "Landroid/content/SharedPreferences;",
+    ],
+}
+
+SUSPICIOUS_STRINGS = [
+    "/system/bin/su", "chmod 777", "superuser", "base64_decode",
+    ".onion", "exec(", "Runtime.getRuntime",
+]
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanResult(BaseModel):
+    service: str = "androguard"
+    status: str
+    apk_filename: str
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+def _extract_strings_from_dex(dex_data: bytes) -> list[str]:
+    strings = []
+    try:
+        if dex_data[:3] != b'dex':
+            return []
+        str_count  = struct.unpack_from('<I', dex_data, 0x38)[0]
+        str_offset = struct.unpack_from('<I', dex_data, 0x3C)[0]
+        for i in range(min(str_count, 8000)):
+            try:
+                ptr = struct.unpack_from('<I', dex_data, str_offset + i * 4)[0]
+                # ULEB128 — lire la longueur
+                length = 0
+                shift  = 0
+                pos    = ptr
+                while True:
+                    b = dex_data[pos]
+                    length |= (b & 0x7F) << shift
+                    pos += 1
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                s = dex_data[pos:pos + length].decode('utf-8', errors='ignore')
+                if len(s) > 5:
+                    strings.append(s)
+            except Exception:
+                continue
+    except Exception as e:
+        log.debug(f"Erreur DEX: {e}")
+    return strings
+
+
+def _scan_apk(apk_path: str) -> list[dict]:
+    findings = []
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            names = z.namelist()
+            dex_files = [n for n in names if n.endswith('.dex')]
+
+            all_strings = []
+            for dex_name in dex_files:
+                dex_data = z.read(dex_name)
+                all_strings.extend(_extract_strings_from_dex(dex_data))
+
+            log.info(f"{len(dex_files)} DEX, {len(all_strings)} strings extraites")
+
+            # APIs dangereuses
+            for severity, apis in DANGEROUS_APIS.items():
+                for api in apis:
+                    matches = [s for s in all_strings if api in s]
+                    if matches:
+                        findings.append({
+                            "type": "dangerous_api", "severity": severity,
+                            "api": api,
+                            "description": f"API sensible détectée : {api}",
+                            "occurrences": len(matches),
+                            "examples": [m[:80] for m in matches[:3]],
+                        })
+
+            # Strings suspectes
+            for pattern in SUSPICIOUS_STRINGS:
+                matches = [s for s in all_strings if pattern.lower() in s.lower()]
+                if matches:
+                    findings.append({
+                        "type": "suspicious_string", "severity": "high",
+                        "pattern": pattern,
+                        "description": f"String suspecte : {pattern}",
+                        "occurrences": len(matches),
+                        "examples": [m[:80] for m in matches[:3]],
+                    })
+
+            # Fichiers suspects embarqués
+            for name in names:
+                if any(name.endswith(ext) for ext in ['.sh', '.py', '.pl', '.rb']):
+                    findings.append({
+                        "type": "suspicious_file", "severity": "high",
+                        "file": name,
+                        "description": f"Script embarqué : {name}",
+                        "occurrences": 1, "examples": [name],
+                    })
+
+            # Libs natives
+            native_libs = [n for n in names if n.endswith('.so')]
+            if native_libs:
+                findings.append({
+                    "type": "native_libraries", "severity": "low",
+                    "description": f"{len(native_libs)} lib(s) native(s)",
+                    "occurrences": len(native_libs),
+                    "examples": native_libs[:5],
+                })
+
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"APK invalide : {apk_path}")
+    return findings
+
+
+def _compute_score(findings):
+    if not findings:
+        return 100
+    penalty = sum({"critical":30,"high":15,"medium":7,"low":2}.get(f.get("severity","low"),2) for f in findings)
+    return max(0, 100 - penalty)
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "androguard", "port": 8004}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+    t0 = time.time()
+    try:
+        findings = _scan_apk(apk_path)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts: counts[sev] += 1
+    score = _compute_score(findings)
+    duration = round(time.time()-t0, 2)
+    counts["score"] = score
+    result = ScanResult(
+        status="success", apk_filename=req.apk_filename,
+        findings=findings, summary=counts, duration_seconds=duration,
+        message=f"{len(findings)} finding(s) — score {score}/100"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(), "repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_permissions — :8006
+Analyse les permissions Android déclarées dans AndroidManifest.xml.
+Classe chaque permission par niveau de dangerosité.
+"""
+import os, time, logging, zipfile, re
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service Permissions", version="1.0.0")
+
+# Classification des permissions Android
+PERMISSIONS_DB = {
+    "critical": [
+        "android.permission.SEND_SMS",
+        "android.permission.RECEIVE_SMS",
+        "android.permission.READ_SMS",
+        "android.permission.PROCESS_OUTGOING_CALLS",
+        "android.permission.CALL_PHONE",
+        "android.permission.READ_CALL_LOG",
+        "android.permission.WRITE_CALL_LOG",
+        "android.permission.BIND_DEVICE_ADMIN",
+        "android.permission.MASTER_CLEAR",
+        "android.permission.FACTORY_RESET",
+        "android.permission.INSTALL_PACKAGES",
+        "android.permission.DELETE_PACKAGES",
+        "android.permission.MOUNT_FORMAT_FILESYSTEMS",
+    ],
+    "high": [
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.MANAGE_EXTERNAL_STORAGE",
+        "android.permission.READ_PHONE_STATE",
+        "android.permission.GET_ACCOUNTS",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT",
+    ],
+    "medium": [
+        "android.permission.INTERNET",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.REQUEST_INSTALL_PACKAGES",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WRITE_SETTINGS",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.NFC",
+        "android.permission.VIBRATE",
+        "android.permission.WAKE_LOCK",
+        "android.permission.DISABLE_KEYGUARD",
+        "android.permission.READ_LOGS",
+    ],
+    "low": [
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_NETWORK_STATE",
+        "android.permission.CHANGE_WIFI_STATE",
+        "android.permission.FLASHLIGHT",
+        "android.permission.RECEIVE_NOTIFICATION",
+        "android.permission.POST_NOTIFICATIONS",
+    ],
+}
+
+# Mapping inversé permission → sévérité
+PERM_SEVERITY = {}
+for sev, perms in PERMISSIONS_DB.items():
+    for p in perms:
+        PERM_SEVERITY[p] = sev
+
+
+def _parse_manifest(apk_path: str) -> list[str]:
+    """Extrait les permissions depuis AndroidManifest.xml (binaire ou texte)."""
+    permissions = []
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            if 'AndroidManifest.xml' not in z.namelist():
+                log.warning("AndroidManifest.xml absent")
+                return []
+
+            manifest_data = z.read('AndroidManifest.xml')
+
+            # Chercher les permissions dans le binaire XML Android
+            # Les strings sont encodées en UTF-16 LE dans le manifest binaire
+            content = manifest_data.decode('utf-8', errors='ignore')
+
+            # Pattern pour permissions dans XML binaire/texte
+            patterns = [
+                r'android\.permission\.[A-Z_]+',
+                r'uses-permission.*?android:name="([^"]+)"',
+            ]
+            for pattern in patterns:
+                matches = re.findall(pattern, content)
+                permissions.extend(matches)
+
+            # Aussi chercher en UTF-16
+            try:
+                content16 = manifest_data.decode('utf-16-le', errors='ignore')
+                matches16 = re.findall(r'android\.permission\.[A-Z_]+', content16)
+                permissions.extend(matches16)
+            except Exception:
+                pass
+
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"APK invalide : {apk_path}")
+
+    # Dédupliquer
+    return list(set(permissions))
+
+
+def _classify_permissions(permissions: list[str]) -> list[dict]:
+    findings = []
+    for perm in permissions:
+        severity = PERM_SEVERITY.get(perm)
+        if not severity:
+            # Permission inconnue ou tierce
+            if "permission" in perm.lower():
+                severity = "low"
+            else:
+                continue
+
+        # Description lisible
+        short_name = perm.split(".")[-1].replace("_", " ").title()
+        descriptions = {
+            "critical": f"Permission critique : permet {short_name} — risque élevé d'abus",
+            "high":     f"Permission sensible : accès à {short_name}",
+            "medium":   f"Permission modérée : {short_name}",
+            "low":      f"Permission standard : {short_name}",
+        }
+
+        findings.append({
+            "permission":  perm,
+            "severity":    severity,
+            "short_name":  short_name,
+            "description": descriptions.get(severity, perm),
+        })
+
+    # Trier par sévérité
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    findings.sort(key=lambda x: order.get(x["severity"], 4))
+    return findings
+
+
+def _compute_score(findings: list[dict]) -> int:
+    if not findings:
+        return 100
+    penalty = sum({"critical":20,"high":10,"medium":4,"low":1}.get(f.get("severity","low"),1) for f in findings)
+    return max(0, 100 - penalty)
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanResult(BaseModel):
+    service: str = "permissions"
+    status: str
+    apk_filename: str
+    permissions_total: int
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "permissions", "port": 8006,
+            "permissions_db": sum(len(v) for v in PERMISSIONS_DB.values())}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    try:
+        permissions = _parse_manifest(apk_path)
+        findings    = _classify_permissions(permissions)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts: counts[sev] += 1
+
+    score = _compute_score(findings)
+    duration = round(time.time()-t0, 2)
+    counts["score"] = score
+
+    result = ScanResult(
+        status="success", apk_filename=req.apk_filename,
+        permissions_total=len(permissions),
+        findings=findings, summary=counts, duration_seconds=duration,
+        message=f"{len(permissions)} permissions — {counts['critical']} critiques, {counts['high']} high — score {score}/100"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(),"repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_network — :8007
+Analyse statique des endpoints réseau dans un APK.
+Extrait URLs, IPs, domaines depuis le bytecode DEX et les ressources.
+"""
+import os, time, logging, zipfile, re, struct
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service Network Analysis", version="1.0.0")
+
+# Patterns de détection
+URL_PATTERN    = re.compile(r'https?://[^\s\'"<>]{4,200}', re.IGNORECASE)
+IP_PATTERN     = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?\b')
+DOMAIN_PATTERN = re.compile(r'\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|co|app|dev|api|xyz|info|biz|online)\b', re.IGNORECASE)
+
+# Domaines/IPs considérés suspects
+SUSPICIOUS_DOMAINS = [".onion", "ngrok.io", "pastebin.com", "bit.ly", "tinyurl.com", "raw.githubusercontent.com"]
+PRIVATE_IPS        = ["192.168.", "10.", "172.16.", "127.0.0.1", "0.0.0.0"]
+CLEARTEXT_HTTP     = re.compile(r'^http://', re.IGNORECASE)
+
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanResult(BaseModel):
+    service: str = "network"
+    status: str
+    apk_filename: str
+    urls: list[str]
+    domains: list[str]
+    ips: list[str]
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+def _extract_strings_from_dex(dex_data: bytes) -> list[str]:
+    strings = []
+    try:
+        if dex_data[:3] != b'dex':
+            return []
+        str_count  = struct.unpack_from('<I', dex_data, 0x38)[0]
+        str_offset = struct.unpack_from('<I', dex_data, 0x3C)[0]
+        for i in range(min(str_count, 10000)):
+            try:
+                ptr    = struct.unpack_from('<I', dex_data, str_offset + i * 4)[0]
+                length = 0; shift = 0; pos = ptr
+                while True:
+                    b = dex_data[pos]; length |= (b & 0x7F) << shift; pos += 1
+                    if not (b & 0x80): break
+                    shift += 7
+                s = dex_data[pos:pos+length].decode('utf-8', errors='ignore')
+                if len(s) > 6: strings.append(s)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return strings
+
+
+def _scan_apk(apk_path: str) -> tuple[list[str], list[str], list[str]]:
+    all_text = []
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            names = z.namelist()
+
+            # Extraire strings des DEX
+            for name in names:
+                if name.endswith('.dex'):
+                    strings = _extract_strings_from_dex(z.read(name))
+                    all_text.extend(strings)
+
+            # Lire les fichiers texte (XML, JSON, properties)
+            text_exts = ('.xml', '.json', '.properties', '.txt', '.html', '.js')
+            for name in names:
+                if any(name.endswith(ext) for ext in text_exts):
+                    try:
+                        content = z.read(name).decode('utf-8', errors='ignore')
+                        all_text.append(content)
+                    except Exception:
+                        pass
+
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"APK invalide : {apk_path}")
+
+    combined = '\n'.join(all_text)
+
+    urls    = list(set(URL_PATTERN.findall(combined)))
+    ips     = list(set(IP_PATTERN.findall(combined)))
+    domains = list(set(DOMAIN_PATTERN.findall(combined)))
+
+    # Filtrer les faux positifs évidents
+    urls    = [u for u in urls if len(u) < 200 and 'android.com' not in u][:100]
+    ips     = [ip for ip in ips if not ip.startswith(('0.0', '255.'))][:50]
+    domains = [d for d in domains if len(d) > 5 and d not in ['example.com']][:100]
+
+    return urls, ips, domains
+
+
+def _analyze_findings(urls, ips, domains) -> list[dict]:
+    findings = []
+
+    # URLs en clair (HTTP)
+    http_urls = [u for u in urls if CLEARTEXT_HTTP.match(u)]
+    if http_urls:
+        findings.append({
+            "type": "cleartext_http", "severity": "high",
+            "description": f"{len(http_urls)} URL(s) en clair HTTP (non chiffré)",
+            "examples": http_urls[:5],
+        })
+
+    # Domaines suspects
+    for domain in domains:
+        for sus in SUSPICIOUS_DOMAINS:
+            if sus in domain:
+                findings.append({
+                    "type": "suspicious_domain", "severity": "critical",
+                    "description": f"Domaine suspect : {domain}",
+                    "examples": [domain],
+                })
+
+    # IPs hardcodées (hors localhost)
+    public_ips = [ip for ip in ips if not any(ip.startswith(p) for p in PRIVATE_IPS)]
+    if public_ips:
+        findings.append({
+            "type": "hardcoded_ip", "severity": "medium",
+            "description": f"{len(public_ips)} IP(s) publique(s) hardcodée(s)",
+            "examples": public_ips[:5],
+        })
+
+    # IPs privées (debug/dev ?)
+    private_ips = [ip for ip in ips if any(ip.startswith(p) for p in PRIVATE_IPS) and ip != "127.0.0.1"]
+    if private_ips:
+        findings.append({
+            "type": "private_ip", "severity": "low",
+            "description": f"IP(s) privée(s) trouvée(s) — possibles endpoints de dev",
+            "examples": private_ips[:5],
+        })
+
+    # Beaucoup d'URLs → surface d'attaque large
+    if len(urls) > 20:
+        findings.append({
+            "type": "large_attack_surface", "severity": "medium",
+            "description": f"{len(urls)} URLs détectées — surface d'attaque réseau étendue",
+            "examples": urls[:3],
+        })
+
+    return findings
+
+
+def _compute_score(findings):
+    if not findings:
+        return 100
+    penalty = sum({"critical":35,"high":15,"medium":7,"low":2}.get(f.get("severity","low"),2) for f in findings)
+    return max(0, 100 - penalty)
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "network", "port": 8007}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    try:
+        urls, ips, domains = _scan_apk(apk_path)
+        findings = _analyze_findings(urls, ips, domains)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts: counts[sev] += 1
+
+    score = _compute_score(findings)
+    duration = round(time.time()-t0, 2)
+    counts["score"] = score
+
+    result = ScanResult(
+        status="success", apk_filename=req.apk_filename,
+        urls=urls[:50], domains=domains[:50], ips=ips[:20],
+        findings=findings, summary=counts, duration_seconds=duration,
+        message=f"{len(urls)} URLs, {len(domains)} domaines, {len(ips)} IPs — score {score}/100"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(),"repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_obfuscation — :8008
+Détecte l'obfuscation et les techniques anti-debug/anti-analysis dans un APK.
+"""
+import os, time, logging, zipfile, re, struct, math
+from collections import Counter
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service Obfuscation Detection", version="1.0.0")
+
+# Signatures d'obfuscateurs connus
+OBFUSCATOR_SIGNATURES = {
+    "ProGuard":    ["proguard", "R8"],
+    "DexGuard":    ["dexguard", "guardsquare"],
+    "DashO":       ["DashO", "preemptive"],
+    "Allatori":    ["allatori"],
+    "Obfuscapk":   ["obfuscapk"],
+}
+
+# Techniques anti-debug/anti-analysis
+ANTI_DEBUG_APIS = [
+    "isDebuggerConnected",
+    "android.os.Debug",
+    "detectDebugger",
+    "Landroid/content/pm/ApplicationInfo;->FLAG_DEBUGGABLE",
+    "ro.debuggable",
+    "ro.secure",
+    "TracerPid",
+]
+
+ANTI_EMULATOR_APIS = [
+    "Build.FINGERPRINT",
+    "Build.MODEL",
+    "generic",
+    "goldfish",
+    "sdk_gphone",
+    "Genymotion",
+    "android.os.Build",
+    "telephony.imei",
+]
+
+ROOT_DETECTION_APIS = [
+    "/system/app/Superuser.apk",
+    "/sbin/su",
+    "/system/bin/su",
+    "/system/xbin/su",
+    "eu.chainfire.supersu",
+    "com.topjohnwu.magisk",
+    "RootBeer",
+]
+
+DYNAMIC_LOADING = [
+    "DexClassLoader",
+    "PathClassLoader",
+    "dalvik.system",
+    "loadDex",
+    "BaseDexClassLoader",
+]
+
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanResult(BaseModel):
+    service: str = "obfuscation"
+    status: str
+    apk_filename: str
+    obfuscation_score: int
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+def _entropy(data: bytes) -> float:
+    if not data: return 0.0
+    counter = Counter(data)
+    length  = len(data)
+    return -sum((c/length) * math.log2(c/length) for c in counter.values() if c > 0)
+
+
+def _extract_strings_from_dex(dex_data: bytes) -> list[str]:
+    strings = []
+    try:
+        if dex_data[:3] != b'dex': return []
+        str_count  = struct.unpack_from('<I', dex_data, 0x38)[0]
+        str_offset = struct.unpack_from('<I', dex_data, 0x3C)[0]
+        for i in range(min(str_count, 10000)):
+            try:
+                ptr = struct.unpack_from('<I', dex_data, str_offset + i * 4)[0]
+                length = 0; shift = 0; pos = ptr
+                while True:
+                    b = dex_data[pos]; length |= (b & 0x7F) << shift; pos += 1
+                    if not (b & 0x80): break
+                    shift += 7
+                s = dex_data[pos:pos+length].decode('utf-8', errors='ignore')
+                if s: strings.append(s)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return strings
+
+
+def _detect_short_names(strings: list[str]) -> bool:
+    """Détecte si les classes/méthodes ont des noms obfusqués (a, b, c...)."""
+    short = [s for s in strings if re.match(r'^[a-z]{1,2}$', s)]
+    return len(short) > 50
+
+
+def _scan_apk(apk_path: str) -> list[dict]:
+    findings = []
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            names = z.namelist()
+            all_strings = []
+            dex_entropies = []
+
+            for name in names:
+                if name.endswith('.dex'):
+                    dex_data = z.read(name)
+                    ent = _entropy(dex_data)
+                    dex_entropies.append(ent)
+                    strings = _extract_strings_from_dex(dex_data)
+                    all_strings.extend(strings)
+
+            combined = '\n'.join(all_strings)
+
+            # 1. Entropie élevée → code chiffré/compressé
+            if dex_entropies:
+                avg_entropy = sum(dex_entropies) / len(dex_entropies)
+                log.info(f"Entropie DEX moyenne: {avg_entropy:.2f}")
+                if avg_entropy > 7.2:
+                    findings.append({
+                        "type": "high_entropy", "severity": "critical",
+                        "description": f"Entropie DEX très élevée ({avg_entropy:.2f}/8.0) — code probablement chiffré ou packé",
+                        "value": round(avg_entropy, 3),
+                    })
+                elif avg_entropy > 6.5:
+                    findings.append({
+                        "type": "high_entropy", "severity": "high",
+                        "description": f"Entropie DEX élevée ({avg_entropy:.2f}/8.0) — possible obfuscation",
+                        "value": round(avg_entropy, 3),
+                    })
+
+            # 2. Noms de classes obfusqués
+            if _detect_short_names(all_strings):
+                findings.append({
+                    "type": "obfuscated_names", "severity": "high",
+                    "description": "Noms de classes/méthodes obfusqués détectés (noms d'1-2 caractères)",
+                })
+
+            # 3. Obfuscateurs connus
+            for obf_name, signatures in OBFUSCATOR_SIGNATURES.items():
+                if any(sig.lower() in combined.lower() for sig in signatures):
+                    findings.append({
+                        "type": "known_obfuscator", "severity": "medium",
+                        "description": f"Obfuscateur détecté : {obf_name}",
+                        "obfuscator": obf_name,
+                    })
+
+            # 4. Anti-debug
+            anti_debug_found = [api for api in ANTI_DEBUG_APIS if api in combined]
+            if anti_debug_found:
+                findings.append({
+                    "type": "anti_debug", "severity": "high",
+                    "description": f"Techniques anti-debug détectées ({len(anti_debug_found)} APIs)",
+                    "examples": anti_debug_found[:5],
+                })
+
+            # 5. Anti-émulateur
+            anti_emu_found = [api for api in ANTI_EMULATOR_APIS if api in combined]
+            if len(anti_emu_found) >= 3:
+                findings.append({
+                    "type": "anti_emulator", "severity": "high",
+                    "description": f"Détection d'émulateur ({len(anti_emu_found)} indicateurs)",
+                    "examples": anti_emu_found[:5],
+                })
+
+            # 6. Détection root
+            root_found = [api for api in ROOT_DETECTION_APIS if api in combined]
+            if root_found:
+                findings.append({
+                    "type": "root_detection", "severity": "medium",
+                    "description": f"Détection de root/jailbreak ({len(root_found)} indicateurs)",
+                    "examples": root_found[:5],
+                })
+
+            # 7. Chargement dynamique de code
+            dyn_found = [api for api in DYNAMIC_LOADING if api in combined]
+            if dyn_found:
+                findings.append({
+                    "type": "dynamic_loading", "severity": "critical",
+                    "description": "Chargement dynamique de code DEX détecté — possible malware dropper",
+                    "examples": dyn_found[:3],
+                })
+
+            # 8. Plusieurs fichiers DEX (multi-dex suspect)
+            dex_count = len([n for n in names if n.endswith('.dex')])
+            if dex_count > 3:
+                findings.append({
+                    "type": "multidex", "severity": "low",
+                    "description": f"{dex_count} fichiers DEX — application volumineuse ou packing suspect",
+                    "value": dex_count,
+                })
+
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"APK invalide : {apk_path}")
+    return findings
+
+
+def _obfuscation_score(findings: list[dict]) -> int:
+    """Score d'obfuscation de 0 (aucune) à 100 (très obfusqué)."""
+    score = 0
+    for f in findings:
+        score += {"critical":30,"high":20,"medium":10,"low":5}.get(f.get("severity","low"),5)
+    return min(100, score)
+
+
+def _security_score(obf_score: int) -> int:
+    return max(0, 100 - obf_score)
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "obfuscation", "port": 8008}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    try:
+        findings = _scan_apk(apk_path)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts: counts[sev] += 1
+
+    obf_score = _obfuscation_score(findings)
+    sec_score = _security_score(obf_score)
+    duration  = round(time.time()-t0, 2)
+    counts["score"] = sec_score
+    counts["obfuscation_level"] = obf_score
+
+    result = ScanResult(
+        status="success", apk_filename=req.apk_filename,
+        obfuscation_score=obf_score,
+        findings=findings, summary=counts, duration_seconds=duration,
+        message=f"Niveau obfuscation : {obf_score}/100 — {len(findings)} technique(s) détectée(s)"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(),"repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_ssl — :8009
+Extrait les domaines d'un APK et vérifie leurs certificats SSL/TLS.
+Détecte : certs expirés, TLS faible, cipher suites obsolètes, self-signed.
+"""
+import os, time, logging, zipfile, re, struct, ssl, socket
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+SSL_TIMEOUT    = int(os.getenv("SSL_TIMEOUT", "5"))
+MAX_DOMAINS    = int(os.getenv("MAX_DOMAINS", "20"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service SSL/TLS Scanner", version="1.0.0")
+
+DOMAIN_PATTERN = re.compile(
+    r'\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|co|app|dev|api|xyz|info)\b',
+    re.IGNORECASE
+)
+
+# Domaines à ignorer (trop génériques)
+IGNORE_DOMAINS = {
+    "android.com", "google.com", "googleapis.com", "gstatic.com",
+    "schema.org", "example.com", "w3.org", "mozilla.org",
+    "apache.org", "github.com", "raw.githubusercontent.com",
+}
+
+WEAK_TLS  = {"TLSv1", "TLSv1.0", "TLSv1.1", "SSLv2", "SSLv3"}
+WEAK_CIPHERS = {"RC4", "DES", "3DES", "NULL", "EXPORT", "MD5"}
+
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class DomainResult(BaseModel):
+    domain: str
+    reachable: bool
+    tls_version: str | None = None
+    cipher: str | None = None
+    cert_expiry: str | None = None
+    days_until_expiry: int | None = None
+    issues: list[str] = []
+    severity: str = "ok"
+
+class ScanResult(BaseModel):
+    service: str = "ssl"
+    status: str
+    apk_filename: str
+    domains_found: int
+    domains_scanned: int
+    domain_results: list[DomainResult]
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+def _extract_strings_from_dex(dex_data: bytes) -> list[str]:
+    strings = []
+    try:
+        if dex_data[:3] != b'dex': return []
+        str_count  = struct.unpack_from('<I', dex_data, 0x38)[0]
+        str_offset = struct.unpack_from('<I', dex_data, 0x3C)[0]
+        for i in range(min(str_count, 10000)):
+            try:
+                ptr = struct.unpack_from('<I', dex_data, str_offset + i * 4)[0]
+                length = 0; shift = 0; pos = ptr
+                while True:
+                    b = dex_data[pos]; length |= (b & 0x7F) << shift; pos += 1
+                    if not (b & 0x80): break
+                    shift += 7
+                s = dex_data[pos:pos+length].decode('utf-8', errors='ignore')
+                if s: strings.append(s)
+            except Exception: continue
+    except Exception: pass
+    return strings
+
+
+def _extract_domains(apk_path: str) -> list[str]:
+    all_text = []
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            for name in z.namelist():
+                if name.endswith('.dex'):
+                    all_text.extend(_extract_strings_from_dex(z.read(name)))
+                elif any(name.endswith(e) for e in ('.xml','.json','.properties')):
+                    try:
+                        all_text.append(z.read(name).decode('utf-8', errors='ignore'))
+                    except Exception: pass
+    except zipfile.BadZipFile:
+        raise RuntimeError(f"APK invalide : {apk_path}")
+
+    combined = '\n'.join(all_text)
+    domains = set(DOMAIN_PATTERN.findall(combined))
+    # Filtrer les domaines ignorés et garder les plus pertinents
+    filtered = [d.lower() for d in domains if d.lower() not in IGNORE_DOMAINS and len(d) > 6]
+    return filtered[:MAX_DOMAINS]
+
+
+def _check_ssl(domain: str) -> DomainResult:
+    issues = []
+    result = DomainResult(domain=domain, reachable=False)
+
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=SSL_TIMEOUT) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                result.reachable    = True
+                result.tls_version  = ssock.version()
+                cipher_info         = ssock.cipher()
+                result.cipher       = cipher_info[0] if cipher_info else None
+
+                # Vérifier la version TLS
+                if result.tls_version in WEAK_TLS:
+                    issues.append(f"Version TLS faible : {result.tls_version}")
+
+                # Vérifier le cipher
+                if result.cipher and any(w in result.cipher for w in WEAK_CIPHERS):
+                    issues.append(f"Cipher faible : {result.cipher}")
+
+                # Vérifier l'expiration du certificat
+                cert = ssock.getpeercert()
+                if cert:
+                    expiry_str = cert.get('notAfter', '')
+                    if expiry_str:
+                        expiry = datetime.strptime(expiry_str, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
+                        now    = datetime.now(timezone.utc)
+                        days   = (expiry - now).days
+                        result.cert_expiry         = expiry.isoformat()
+                        result.days_until_expiry   = days
+                        if days < 0:
+                            issues.append(f"Certificat EXPIRÉ depuis {-days} jours")
+                        elif days < 30:
+                            issues.append(f"Certificat expire dans {days} jours")
+
+    except ssl.SSLCertVerificationError as e:
+        result.reachable = True
+        issues.append(f"Certificat invalide/self-signed : {str(e)[:80]}")
+    except ssl.SSLError as e:
+        result.reachable = True
+        issues.append(f"Erreur SSL : {str(e)[:80]}")
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        result.reachable = False  # Domaine non joignable — pas une erreur
+    except Exception as e:
+        log.debug(f"Erreur SSL pour {domain}: {e}")
+
+    result.issues = issues
+    if issues:
+        if any("EXPIRÉ" in i or "self-signed" in i or "invalide" in i for i in issues):
+            result.severity = "critical"
+        elif any("faible" in i or "expire" in i for i in issues):
+            result.severity = "high"
+        else:
+            result.severity = "medium"
+
+    return result
+
+
+def _build_findings(domain_results: list[DomainResult]) -> list[dict]:
+    findings = []
+    expired     = [r for r in domain_results if r.reachable and any("EXPIRÉ" in i for i in r.issues)]
+    expiring    = [r for r in domain_results if r.reachable and r.days_until_expiry is not None and 0 <= r.days_until_expiry < 30]
+    weak_tls    = [r for r in domain_results if r.reachable and r.tls_version in WEAK_TLS]
+    invalid_cert= [r for r in domain_results if r.reachable and any("self-signed" in i or "invalide" in i for i in r.issues)]
+
+    if expired:
+        findings.append({"type":"expired_cert","severity":"critical",
+            "description":f"{len(expired)} certificat(s) expiré(s)",
+            "examples":[r.domain for r in expired]})
+    if invalid_cert:
+        findings.append({"type":"invalid_cert","severity":"critical",
+            "description":f"{len(invalid_cert)} certificat(s) invalide(s)/self-signed",
+            "examples":[r.domain for r in invalid_cert]})
+    if weak_tls:
+        findings.append({"type":"weak_tls","severity":"high",
+            "description":f"{len(weak_tls)} domaine(s) avec TLS faible ({', '.join(set(r.tls_version for r in weak_tls))})",
+            "examples":[r.domain for r in weak_tls]})
+    if expiring:
+        findings.append({"type":"expiring_cert","severity":"medium",
+            "description":f"{len(expiring)} certificat(s) expirant dans moins de 30 jours",
+            "examples":[f"{r.domain} ({r.days_until_expiry}j)" for r in expiring]})
+    return findings
+
+
+def _compute_score(findings):
+    if not findings: return 100
+    penalty = sum({"critical":30,"high":15,"medium":7,"low":2}.get(f.get("severity","low"),2) for f in findings)
+    return max(0, 100 - penalty)
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "ssl", "port": 8009,
+            "ssl_timeout": SSL_TIMEOUT, "max_domains": MAX_DOMAINS}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    try:
+        domains = _extract_domains(apk_path)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    log.info(f"{len(domains)} domaines extraits — scan SSL...")
+    domain_results = [_check_ssl(d) for d in domains]
+    reachable      = [r for r in domain_results if r.reachable]
+    findings       = _build_findings(reachable)
+
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts: counts[sev] += 1
+
+    score    = _compute_score(findings)
+    duration = round(time.time()-t0, 2)
+    counts["score"] = score
+
+    result = ScanResult(
+        status="success", apk_filename=req.apk_filename,
+        domains_found=len(domains), domains_scanned=len(reachable),
+        domain_results=domain_results, findings=findings, summary=counts,
+        duration_seconds=duration,
+        message=f"{len(domains)} domaines trouvés, {len(reachable)} joignables, {len(findings)} problème(s) SSL — score {score}/100"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(),"repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_virustotal — :8005
+Soumet l'APK à VirusTotal et récupère le rapport de détection malware.
+"""
+import os, time, logging, hashlib
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+APK_STORAGE    = os.getenv("APK_STORAGE_PATH", "/apk_storage")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8004/results")
+VT_API_KEY     = os.getenv("VT_API_KEY", "")
+VT_BASE        = "https://www.virustotal.com/api/v3"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+app = FastAPI(title="Service VirusTotal", version="1.0.0")
+
+
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanResult(BaseModel):
+    service: str = "virustotal"
+    status: str
+    apk_filename: str
+    file_hash: str | None = None
+    findings: list[dict]
+    summary: dict
+    duration_seconds: float
+    message: str
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _check_existing(file_hash: str, headers: dict) -> dict | None:
+    """Vérifie si le fichier est déjà connu de VT via son hash."""
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{VT_BASE}/files/{file_hash}", headers=headers)
+        if r.status_code == 200:
+            return r.json()
+        return None
+
+
+async def _upload_file(apk_path: str, headers: dict) -> str:
+    """Uploade l'APK et retourne l'analysis ID."""
+    async with httpx.AsyncClient(timeout=120) as c:
+        with open(apk_path, 'rb') as f:
+            files = {"file": (os.path.basename(apk_path), f, "application/octet-stream")}
+            r = await c.post(f"{VT_BASE}/files", headers=headers, files=files)
+            r.raise_for_status()
+            return r.json()["data"]["id"]
+
+
+async def _wait_for_analysis(analysis_id: str, headers: dict, max_wait: int = 120) -> dict:
+    """Attend la fin de l'analyse VT (polling)."""
+    async with httpx.AsyncClient(timeout=30) as c:
+        for _ in range(max_wait // 10):
+            r = await c.get(f"{VT_BASE}/analyses/{analysis_id}", headers=headers)
+            data = r.json()
+            status = data.get("data", {}).get("attributes", {}).get("status")
+            if status == "completed":
+                return data
+            time.sleep(10)
+    raise RuntimeError("Timeout VirusTotal — analyse trop longue")
+
+
+def _parse_results(vt_data: dict) -> tuple[list[dict], dict]:
+    """Parse le rapport VT et retourne findings + summary."""
+    attrs = vt_data.get("data", {}).get("attributes", {})
+    stats = attrs.get("last_analysis_stats", attrs.get("stats", {}))
+    results = attrs.get("last_analysis_results", attrs.get("results", {}))
+
+    malicious  = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    total      = sum(stats.values()) if stats else 0
+
+    findings = []
+    for engine, result in results.items():
+        category = result.get("category", "")
+        if category in ("malicious", "suspicious"):
+            findings.append({
+                "engine":   engine,
+                "severity": "critical" if category == "malicious" else "high",
+                "category": category,
+                "result":   result.get("result", ""),
+                "version":  result.get("engine_version", ""),
+            })
+
+    severity = "clean"
+    if malicious > 5:   severity = "critical"
+    elif malicious > 0: severity = "high"
+    elif suspicious > 0: severity = "medium"
+
+    summary = {
+        "malicious":  malicious,
+        "suspicious": suspicious,
+        "clean":      stats.get("undetected", 0),
+        "total":      total,
+        "severity":   severity,
+        "score":      max(0, 100 - malicious * 15 - suspicious * 5),
+    }
+    return findings, summary
+
+
+async def _notify_aggregator(payload):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(AGGREGATOR_URL, json=payload)
+    except Exception as e:
+        log.warning(f"Aggregator: {e}")
+
+
+@app.get("/health")
+def health():
+    configured = bool(VT_API_KEY)
+    return {"status": "ok", "service": "virustotal", "port": 8005, "api_key_configured": configured}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    if not VT_API_KEY:
+        raise HTTPException(503, "VT_API_KEY non configurée dans .env")
+
+    apk_path = os.path.join(APK_STORAGE, req.apk_filename)
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    headers = {"x-apikey": VT_API_KEY}
+    file_hash = _sha256(apk_path)
+    log.info(f"SHA256: {file_hash}")
+
+    try:
+        # 1. Vérifier si déjà connu de VT
+        vt_data = await _check_existing(file_hash, headers)
+
+        if vt_data:
+            log.info("Fichier déjà connu de VT — récupération rapport existant")
+        else:
+            log.info("Fichier inconnu — upload vers VT")
+            analysis_id = await _upload_file(apk_path, headers)
+            vt_data = await _wait_for_analysis(analysis_id, headers)
+
+        findings, summary = _parse_results(vt_data)
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Erreur API VirusTotal : {e.response.status_code}")
+    except RuntimeError as e:
+        raise HTTPException(504, str(e))
+
+    duration = round(time.time() - t0, 2)
+    result = ScanResult(
+        status="success",
+        apk_filename=req.apk_filename,
+        file_hash=file_hash,
+        findings=findings,
+        summary=summary,
+        duration_seconds=duration,
+        message=f"{summary['malicious']}/{summary['total']} moteurs détectent un malware — score {summary['score']}/100"
+    )
+    bg.add_task(_notify_aggregator, {**result.model_dump(), "repo":req.repo,"branch":req.branch,"commit":req.commit})
+    return result
+"""
+service_syft — :8003
+Analyse les dépendances d'un APK Android en lisant :
+  - META-INF/*.version  (AndroidX / Jetpack)
+  - META-INF/*.properties (metadata Gradle)
+  - classes.dex (présence détectée)
+Puis scanne les CVE avec Grype sur ces packages.
+"""
+import os
+import json
+import time
+import subprocess
+import logging
+import shutil
+import zipfile
+import tempfile
+import re
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+from config import APK_STORAGE_PATH, AGGREGATOR_URL
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+app = FastAPI(title="Service Syft/Grype Scanner", version="3.0.0")
+
+
+# ── Schémas ────────────────────────────────────────────────────────────────────
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanSummary(BaseModel):
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    score: int | None = None
+
+class ScanResult(BaseModel):
+    service: str = "syft_grype"
+    status: str
+    apk_filename: str
+    sbom: dict | None = None
+    findings: list[dict]
+    summary: ScanSummary
+    duration_seconds: float
+    message: str
+
+
+# ── Extraction des packages depuis l'APK ──────────────────────────────────────
+def _extract_packages_from_apk(apk_path: str) -> list[dict]:
+    """
+    Extrait les packages depuis un APK Android en lisant :
+    - META-INF/<group>_<artifact>.version  → version des libs AndroidX/Jetpack
+    - META-INF/com/android/build/gradle/app-metadata.properties → metadata app
+    """
+    packages = []
+    seen = set()
+
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            names = z.namelist()
+
+            for name in names:
+                # Pattern : META-INF/androidx.core_core-ktx.version
+                if name.startswith("META-INF/") and name.endswith(".version"):
+                    basename = name.replace("META-INF/", "").replace(".version", "")
+
+                    # Séparer group et artifact : "androidx.core_core-ktx" → group=androidx.core, artifact=core-ktx
+                    if "_" in basename:
+                        parts = basename.split("_", 1)
+                        group = parts[0]
+                        artifact = parts[1]
+                    else:
+                        group = "android"
+                        artifact = basename
+
+                    try:
+                        version = z.read(name).decode("utf-8").strip()
+                    except Exception:
+                        version = "unknown"
+
+                    key = f"{group}:{artifact}"
+                    if key not in seen and version:
+                        seen.add(key)
+                        packages.append({
+                            "name": artifact,
+                            "version": version,
+                            "type": "java-archive",
+                            "group": group,
+                            "source": name,
+                        })
+
+                # Lire les metadata Gradle
+                elif name == "META-INF/com/android/build/gradle/app-metadata.properties":
+                    try:
+                        content = z.read(name).decode("utf-8")
+                        for line in content.splitlines():
+                            if "=" in line:
+                                k, v = line.split("=", 1)
+                                log.info(f"App metadata: {k.strip()}={v.strip()}")
+                    except Exception:
+                        pass
+
+                # Détecter les .jar embarqués
+                elif name.endswith(".jar") and "META-INF" not in name:
+                    jar_name = os.path.basename(name).replace(".jar", "")
+                    if jar_name not in seen:
+                        seen.add(jar_name)
+                        packages.append({
+                            "name": jar_name,
+                            "version": "embedded",
+                            "type": "java-archive",
+                            "group": "embedded",
+                            "source": name,
+                        })
+
+    except zipfile.BadZipFile:
+        log.error(f"Fichier APK invalide ou corrompu : {apk_path}")
+
+    log.info(f"{len(packages)} packages extraits de l'APK")
+    return packages
+
+
+def _build_syft_sbom(apk_path: str, packages: list[dict]) -> dict:
+    """Construit un SBOM au format Syft à partir des packages extraits."""
+    artifacts = []
+    for i, pkg in enumerate(packages):
+        artifacts.append({
+            "id": f"pkg-{i:04d}",
+            "name": pkg["name"],
+            "version": pkg["version"],
+            "type": pkg["type"],
+            "foundBy": "apk-meta-inf-cataloger",
+            "locations": [{"path": pkg["source"]}],
+            "licenses": [],
+            "language": "java",
+            "cpes": [
+                f"cpe:2.3:a:{pkg['group']}:{pkg['name']}:{pkg['version']}:*:*:*:*:*:*:*"
+            ],
+            "purl": f"pkg:maven/{pkg['group']}/{pkg['name']}@{pkg['version']}",
+            "metadataType": "JavaMetadata",
+            "metadata": {"groupId": pkg["group"], "artifactId": pkg["name"]}
+        })
+
+    return {
+        "artifacts": artifacts,
+        "source": {
+            "type": "file",
+            "target": apk_path,
+        },
+        "schema": {"version": "16.0.0"}
+    }
+
+
+def _scan_cve_with_grype(sbom_data: dict) -> list[dict]:
+    """Scanne les CVE avec Grype en lui passant le SBOM via stdin."""
+    sbom_json = json.dumps(sbom_data)
+    env = {**os.environ, "GRYPE_CHECK_FOR_APP_UPDATE": "false"}
+
+    r = subprocess.run(
+        ["grype", "-o", "json", "-"],
+        input=sbom_json,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env
+    )
+
+    if r.returncode not in (0, 1):
+        if "database does not exist" in r.stderr:
+            log.warning("Base CVE absente — scan CVE ignoré")
+            return []
+        log.warning(f"Grype code {r.returncode}: {r.stderr[:200]}")
+        return []
+
+    stdout = r.stdout.strip()
+    json_start = stdout.find('{')
+    if json_start < 0:
+        return []
+    stdout = stdout[json_start:]
+
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+
+    matches = raw.get("matches", [])
+    findings = []
+    sev_map = {"critical":"critical","high":"high","medium":"medium",
+               "low":"low","negligible":"low","unknown":"low"}
+
+    for m in matches:
+        vuln     = m.get("vulnerability", {})
+        artifact = m.get("artifact", {})
+        severity = sev_map.get(vuln.get("severity","unknown").lower(), "low")
+
+        findings.append({
+            "cve_id":      vuln.get("id", ""),
+            "severity":    severity,
+            "cvss":        vuln.get("cvss",[{}])[0].get("metrics",{}).get("baseScore") if vuln.get("cvss") else None,
+            "description": vuln.get("description","")[:300],
+            "package":     artifact.get("name",""),
+            "version":     artifact.get("version",""),
+            "fix_version": vuln.get("fix",{}).get("versions",[None])[0],
+            "urls":        vuln.get("urls",[])[:2],
+        })
+
+    return findings
+
+
+def _compute_score(findings: list[dict]) -> int:
+    if not findings:
+        return 100
+    penalty = sum({"critical":35,"high":15,"medium":7,"low":2}.get(f.get("severity","low"),2) for f in findings)
+    return max(0, 100 - penalty)
+
+
+async def _notify_aggregator(payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(AGGREGATOR_URL, json=payload)
+            log.info(f"Aggregator notifié : {r.status_code}")
+    except Exception as e:
+        log.warning(f"Aggregator inaccessible : {e}")
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    tools = {}
+    for tool in ["syft", "grype"]:
+        try:
+            r = subprocess.run([tool, "version"], capture_output=True, text=True)
+            tools[tool] = r.stdout.strip().split("\n")[0]
+        except FileNotFoundError:
+            tools[tool] = "NON INSTALLÉ"
+
+    db_check = subprocess.run(
+        ["grype", "db", "status"],
+        capture_output=True, text=True,
+        env={**os.environ, "GRYPE_CHECK_FOR_APP_UPDATE": "false"}
+    )
+    tools["grype_db"] = "ok" if db_check.returncode == 0 else "ABSENTE"
+    return {"status": "ok", "service": "syft_grype", "port": 8003, "tools": tools}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE_PATH, req.apk_filename)
+
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    log.info(f"Scan APK : {req.apk_filename}")
+
+    try:
+        # 1. Extraire les packages depuis META-INF de l'APK
+        packages = _extract_packages_from_apk(apk_path)
+
+        # 2. Construire un SBOM synthétique
+        sbom = _build_syft_sbom(apk_path, packages)
+
+        # 3. Scanner les CVE avec Grype
+        findings = _scan_cve_with_grype(sbom)
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Timeout Grype (> 120s)")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    counts = {"critical":0,"high":0,"medium":0,"low":0}
+    for f in findings:
+        sev = f.get("severity","low")
+        if sev in counts:
+            counts[sev] += 1
+
+    score    = _compute_score(findings)
+    duration = round(time.time() - t0, 2)
+    nb_pkg   = len(packages)
+    nb_cve   = len(findings)
+
+    summary = ScanSummary(score=score, **counts)
+    result  = ScanResult(
+        status="success",
+        apk_filename=req.apk_filename,
+        sbom={
+            "packages_count": nb_pkg,
+            "packages": packages,
+            "artifacts": sbom.get("artifacts", [])[:50],
+        },
+        findings=findings,
+        summary=summary,
+        duration_seconds=duration,
+        message=f"{nb_pkg} packages détectés, {nb_cve} CVE trouvées en {duration}s — score {score}/100"
+    )
+
+    bg.add_task(_notify_aggregator, {
+        **result.model_dump(),
+        "repo": req.repo, "branch": req.branch, "commit": req.commit,
+    })
+
+    return result
+"""
+service_gitleaks — :8002
+Détecte les secrets hardcodés dans un repo via Gitleaks.
+"""
+import os
+import json
+import time
+import subprocess
+import logging
+import tempfile
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import httpx
+
+from config import REPOS_STORAGE_PATH, AGGREGATOR_URL
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+app = FastAPI(title="Service Gitleaks Scanner", version="2.0.0")
+
+
+# ── Schémas ────────────────────────────────────────────────────────────────────
+class ScanRequest(BaseModel):
+    repo_path: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanSummary(BaseModel):
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    score: int | None = None
+
+class ScanResult(BaseModel):
+    service: str = "gitleaks"
+    status: str
+    repo_path: str
+    findings: list[dict]
+    summary: ScanSummary
+    duration_seconds: float
+    message: str
+
+
+# ── Sévérité par règle ─────────────────────────────────────────────────────────
+CRITICAL_RULES = {"aws-access-token", "aws-secret-access-key", "private-key", "github-pat", "gcp-api-key"}
+HIGH_RULES     = {"generic-api-key", "generic-secret", "password", "stripe-api-key", "twilio-api-key"}
+
+def _severity_from_rule(rule_id: str) -> str:
+    r = rule_id.lower()
+    if any(k in r for k in ("aws", "private-key", "gcp", "github-pat")):
+        return "critical"
+    if any(k in r for k in ("api-key", "secret", "password", "token", "stripe", "twilio")):
+        return "high"
+    return "medium"
+
+
+def _compute_score(findings: list[dict]) -> int:
+    if not findings:
+        return 100
+    penalty = sum({"critical": 40, "high": 20, "medium": 10, "low": 3}.get(f.get("severity", "medium"), 10) for f in findings)
+    return max(0, 100 - penalty)
+
+
+def _run_gitleaks(repo_path: str) -> list[dict]:
+    """Lance gitleaks detect sur le repo avec --no-git pour scanner les fichiers."""
+
+    # Utiliser un fichier temporaire pour le rapport
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        report_file = tmp.name
+
+    try:
+        cmd = [
+            "gitleaks", "detect",
+            "--source", repo_path,
+            "--report-format", "json",
+            "--report-path", report_file,
+            "--no-git",          # scanner les fichiers sans historique git
+            "--no-banner",
+            "--exit-code", "0",  # 0=ok, 1=secrets trouvés — les deux sont valides
+        ]
+        log.info(f"Gitleaks cmd : {' '.join(cmd)}")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        log.info(f"Gitleaks exit code: {result.returncode}")
+        if result.stderr:
+            log.info(f"Gitleaks stderr: {result.stderr[:300]}")
+
+        if result.returncode not in (0, 1):
+            raise RuntimeError(f"Gitleaks a crashé (code {result.returncode}): {result.stderr[:300]}")
+
+        # Lire le rapport JSON
+        if not os.path.exists(report_file) or os.path.getsize(report_file) == 0:
+            log.info("Rapport Gitleaks vide — aucun secret trouvé")
+            return []
+
+        with open(report_file) as f:
+            raw = json.load(f)
+
+        if not raw:
+            return []
+
+        findings = []
+        for item in raw:
+            rule_id     = item.get("RuleID", "unknown")
+            severity    = _severity_from_rule(rule_id)
+            secret      = item.get("Secret", "")
+            # Masquer le secret — ne jamais l'exposer en clair
+            masked      = secret[:4] + "****" + secret[-2:] if len(secret) > 6 else "****"
+
+            findings.append({
+                "rule_id":     rule_id,
+                "severity":    severity,
+                "description": item.get("Description", rule_id),
+                "file":        item.get("File", ""),
+                "line":        item.get("StartLine", 0),
+                "commit":      item.get("Commit", ""),
+                "author":      item.get("Author", ""),
+                "secret":      masked,
+                "match":       item.get("Match", "")[:100],
+            })
+
+        return findings
+
+    finally:
+        # Toujours nettoyer le fichier temporaire
+        try:
+            os.unlink(report_file)
+        except Exception:
+            pass
+
+
+async def _notify_aggregator(payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(AGGREGATOR_URL, json=payload)
+            log.info(f"Aggregator notifié : {r.status_code}")
+    except Exception as e:
+        log.warning(f"Aggregator inaccessible : {e}")
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    try:
+        r = subprocess.run(["gitleaks", "version"], capture_output=True, text=True)
+        version = r.stdout.strip()
+    except FileNotFoundError:
+        version = "NON INSTALLÉ"
+    return {"status": "ok", "service": "gitleaks", "port": 8002, "gitleaks": version}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    # Sécurité : vérifier que le path est dans REPOS_STORAGE_PATH
+    repo_path = req.repo_path
+    if not os.path.exists(repo_path):
+        raise HTTPException(404, f"Repo introuvable : {repo_path}")
+
+    t0 = time.time()
+    log.info(f"Scan Gitleaks : {repo_path}")
+
+    try:
+        findings = _run_gitleaks(repo_path)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Timeout Gitleaks (> 300s)")
+
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for f in findings:
+        sev = f.get("severity", "medium")
+        if sev in counts:
+            counts[sev] += 1
+
+    score    = _compute_score(findings)
+    duration = round(time.time() - t0, 2)
+    nb       = len(findings)
+
+    summary = ScanSummary(score=score, **counts)
+    result  = ScanResult(
+        status="success",
+        repo_path=repo_path,
+        findings=findings,
+        summary=summary,
+        duration_seconds=duration,
+        message=f"{nb} secret(s) détecté(s) en {duration}s — score {score}/100"
+    )
+
+    bg.add_task(_notify_aggregator, {
+        **result.model_dump(),
+        "repo": req.repo,
+        "branch": req.branch,
+        "commit": req.commit,
+    })
+
+    return result
+"""
+service_mobsf — :8001
+Reçoit un chemin APK, le scanne avec MobSF, retourne un rapport JSON normalisé.
+Contrat : POST /scan { apk_filename } → ScanResult
+"""
+import os
+import time
+import logging
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+
+from config import APK_STORAGE_PATH, MOBSF_URL, MOBSF_API_KEY, AGGREGATOR_URL
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+app = FastAPI(title="Service MobSF Scanner", version="1.0.0")
+
+
+# ── Schémas ────────────────────────────────────────────────────────────────────
+class ScanRequest(BaseModel):
+    apk_filename: str
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+
+class ScanSummary(BaseModel):
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    score: int | None = None
+
+class ScanResult(BaseModel):
+    service: str = "mobsf"
+    status: str
+    apk_filename: str
+    findings: dict | None = None
+    summary: ScanSummary
+    duration_seconds: float
+    message: str
+
+
+# ── Helpers MobSF ──────────────────────────────────────────────────────────────
+def _headers() -> dict:
+    return {"Authorization": MOBSF_API_KEY}
+
+
+async def _upload(apk_path: str, client: httpx.AsyncClient) -> str:
+    with open(apk_path, "rb") as f:
+        r = await client.post(
+            f"{MOBSF_URL}/api/v1/upload",
+            files={"file": (Path(apk_path).name, f, "application/octet-stream")},
+            headers=_headers(), timeout=120
+        )
+    r.raise_for_status()
+    return r.json()["hash"]
+
+
+async def _scan(file_hash: str, client: httpx.AsyncClient) -> None:
+    r = await client.post(
+        f"{MOBSF_URL}/api/v1/scan",
+        data={"hash": file_hash, "re_scan": 0},
+        headers=_headers(), timeout=600
+    )
+    r.raise_for_status()
+
+
+async def _report(file_hash: str, client: httpx.AsyncClient) -> dict:
+    r = await client.post(
+        f"{MOBSF_URL}/api/v1/report_json",
+        data={"hash": file_hash},
+        headers=_headers(), timeout=60
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _extract_summary(report: dict) -> ScanSummary:
+    """Normalise le rapport MobSF en compteurs criticity."""
+    appsec = report.get("appsec", {})
+    findings = report.get("findings", {})
+
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for item in findings.values():
+        sev = str(item.get("level", "")).lower()
+        if sev in counts:
+            counts[sev] += 1
+
+    score = appsec.get("security_score")
+    return ScanSummary(score=score, **counts)
+
+
+async def _notify_aggregator(payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(AGGREGATOR_URL, json=payload)
+            log.info(f"Aggregator notifié : {r.status_code}")
+    except Exception as e:
+        log.warning(f"Aggregator inaccessible : {e}")
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "mobsf", "port": 8001}
+
+
+@app.post("/scan", response_model=ScanResult)
+async def scan(req: ScanRequest, bg: BackgroundTasks):
+    apk_path = os.path.join(APK_STORAGE_PATH, req.apk_filename)
+
+    if not os.path.exists(apk_path):
+        raise HTTPException(404, f"APK introuvable : {apk_path}")
+
+    t0 = time.time()
+    log.info(f"Scan MobSF : {req.apk_filename}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            file_hash = await _upload(apk_path, client)
+            await _scan(file_hash, client)
+            report = await _report(file_hash, client)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"MobSF erreur {e.response.status_code}: {e.response.text[:300]}")
+    except httpx.RequestError as e:
+        raise HTTPException(503, f"MobSF inaccessible : {e}")
+
+    summary = _extract_summary(report)
+    duration = round(time.time() - t0, 2)
+
+    result = ScanResult(
+        status="success",
+        apk_filename=req.apk_filename,
+        findings=report,
+        summary=summary,
+        duration_seconds=duration,
+        message=f"Scan terminé en {duration}s — score {summary.score}/100"
+    )
+
+    # Envoyer à l'agrégateur sans bloquer la réponse
+    bg.add_task(_notify_aggregator, {
+        **result.model_dump(),
+        "repo": req.repo,
+        "branch": req.branch,
+        "commit": req.commit,
+    })
+
+    return result
+
+
+@app.get("/mobsf/status")
+async def mobsf_status():
+    """Vérifie que MobSF Docker est accessible."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{MOBSF_URL}/api/v1/scans", headers=_headers())
+            return {"reachable": True, "status_code": r.status_code}
+    except Exception as e:
+        return {"reachable": False, "error": str(e)}

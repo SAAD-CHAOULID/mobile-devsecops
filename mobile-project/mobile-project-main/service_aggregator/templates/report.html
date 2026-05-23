@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MobSecOps — {{ meta.repo }}@{{ meta.commit[:8] }}</title>
+<style>
+  :root {
+    --critical: #dc2626; --high: #ea580c; --medium: #d97706; --low: #65a30d;
+    --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0;
+    --muted: #94a3b8; --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }
+  h1 { font-size: 1.6rem; font-weight: 700; }
+  h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; color: var(--accent); text-transform: uppercase; letter-spacing: .05em; }
+  h3 { font-size: .95rem; font-weight: 600; margin-bottom: .5rem; }
+
+  .header { display: flex; align-items: center; gap: 1.5rem; margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+  .logo { font-size: 2rem; }
+  .meta { color: var(--muted); font-size: .85rem; margin-top: .3rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: .75rem; padding: 1.25rem; }
+  .card.wide { grid-column: 1 / -1; }
+
+  .score-ring { display: flex; align-items: center; gap: 1rem; }
+  .score-num { font-size: 3rem; font-weight: 800; }
+  .score-label { font-size: .8rem; color: var(--muted); }
+
+  .badge { display: inline-block; padding: .25rem .75rem; border-radius: 999px; font-size: .75rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+  .badge-critical { background: #7f1d1d; color: #fca5a5; }
+  .badge-high     { background: #7c2d12; color: #fdba74; }
+  .badge-medium   { background: #78350f; color: #fde68a; }
+  .badge-low      { background: #14532d; color: #86efac; }
+  .badge-ok       { background: #1e3a5f; color: #93c5fd; }
+
+  .stat { text-align: center; }
+  .stat-num { font-size: 2rem; font-weight: 700; }
+  .stat-label { font-size: .75rem; color: var(--muted); margin-top: .25rem; }
+  .stat-critical .stat-num { color: var(--critical); }
+  .stat-high     .stat-num { color: var(--high); }
+  .stat-medium   .stat-num { color: var(--medium); }
+  .stat-low      .stat-num { color: var(--low); }
+
+  .finding { border-left: 3px solid var(--border); padding: .75rem 1rem; margin-bottom: .5rem; border-radius: 0 .5rem .5rem 0; background: rgba(255,255,255,.03); }
+  .finding-critical { border-color: var(--critical); }
+  .finding-high     { border-color: var(--high); }
+  .finding-medium   { border-color: var(--medium); }
+  .finding-low      { border-color: var(--low); }
+  .finding-header { display: flex; align-items: center; gap: .75rem; margin-bottom: .35rem; flex-wrap: wrap; }
+  .finding-title { font-size: .875rem; font-weight: 500; }
+  .finding-svc { font-size: .7rem; color: var(--muted); background: var(--border); padding: .15rem .5rem; border-radius: 999px; }
+  .finding-desc { font-size: .8rem; color: var(--muted); }
+
+  .ticket { background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: .5rem; padding: 1rem; margin-bottom: .75rem; }
+  .ticket-header { display: flex; align-items: center; gap: .75rem; margin-bottom: .5rem; }
+  .ticket-title { font-weight: 600; font-size: .9rem; }
+  .ticket-body { font-size: .82rem; color: var(--muted); line-height: 1.6; }
+  .ticket-body strong { color: var(--text); }
+
+  .service-section { margin-bottom: .75rem; }
+  .service-title { font-size: .85rem; font-weight: 600; color: var(--accent); margin-bottom: .5rem; display: flex; align-items: center; gap: .5rem; }
+  .service-score { font-size: .75rem; background: var(--border); padding: .1rem .5rem; border-radius: 999px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: .5rem .75rem; border-bottom: 1px solid var(--border); }
+  td { padding: .5rem .75rem; border-bottom: 1px solid rgba(51,65,85,.5); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: 'Courier New', monospace; font-size: .75rem; word-break: break-all; }
+
+  .ai-summary { font-size: .9rem; line-height: 1.7; color: var(--muted); background: rgba(59,130,246,.08); border: 1px solid rgba(59,130,246,.2); border-radius: .5rem; padding: 1rem; margin-bottom: 1rem; }
+  .release-notes { font-size: .85rem; line-height: 1.6; color: var(--muted); background: rgba(220,38,38,.07); border: 1px solid rgba(220,38,38,.2); border-radius: .5rem; padding: 1rem; }
+  .key-findings { list-style: none; }
+  .key-findings li { padding: .35rem 0; font-size: .85rem; color: var(--muted); }
+  .key-findings li::before { content: "→ "; color: var(--accent); }
+
+  .push-yes { color: #4ade80; font-weight: 700; }
+  .push-no  { color: #f87171; font-weight: 700; }
+  .footer { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .75rem; color: var(--muted); text-align: center; }
+  .section { margin-bottom: 2rem; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="logo">🛡️</div>
+  <div>
+    <h1>MobSecOps Security Report</h1>
+    <div class="meta">
+      <strong>Repo:</strong> {{ meta.repo }} &nbsp;|&nbsp;
+      <strong>Commit:</strong> {{ meta.commit[:8] }} &nbsp;|&nbsp;
+      <strong>Branch:</strong> {{ meta.branch or '—' }} &nbsp;|&nbsp;
+      {% if meta.apk_filename %}<strong>APK:</strong> {{ meta.apk_filename }} &nbsp;|&nbsp;{% endif %}
+      <strong>Généré le:</strong> {{ generated_at }}
+    </div>
+  </div>
+</div>
+
+<!-- OVERVIEW -->
+<div class="grid">
+  <div class="card">
+    <h2>Score Global</h2>
+    <div class="score-ring">
+      <div class="score-num" style="color: {% if score >= 80 %}#4ade80{% elif score >= 50 %}#facc15{% else %}#f87171{% endif %}">{{ score }}</div>
+      <div>
+        <div class="score-label">/ 100</div>
+        <span class="badge badge-{{ risk }}">{{ risk | upper }}</span>
+      </div>
+    </div>
+  </div>
+  <div class="card stat stat-critical">
+    <div class="stat-num">{{ counts.critical }}</div>
+    <div class="stat-label">CRITICAL</div>
+  </div>
+  <div class="card stat stat-high">
+    <div class="stat-num">{{ counts.high }}</div>
+    <div class="stat-label">HIGH</div>
+  </div>
+  <div class="card stat stat-medium">
+    <div class="stat-num">{{ counts.medium }}</div>
+    <div class="stat-label">MEDIUM</div>
+  </div>
+  <div class="card stat stat-low">
+    <div class="stat-num">{{ counts.low }}</div>
+    <div class="stat-label">LOW</div>
+  </div>
+  <div class="card" style="display:flex; flex-direction:column; justify-content:center; align-items:center;">
+    <div style="font-size:1.5rem">{% if ai.push_recommendation %}✅{% else %}🚫{% endif %}</div>
+    <div class="stat-label" style="margin-top:.5rem">Push {% if ai.push_recommendation %}<span class="push-yes">Autorisé</span>{% else %}<span class="push-no">Bloqué</span>{% endif %}</div>
+  </div>
+</div>
+
+<!-- AI REPORT -->
+<div class="card section">
+  <h2>Analyse IA</h2>
+  <div class="ai-summary">{{ ai.summary }}</div>
+  {% if ai.key_findings %}
+  <h3 style="margin-bottom:.5rem; color:var(--muted); font-size:.8rem; text-transform:uppercase;">Points clés</h3>
+  <ul class="key-findings">
+    {% for kf in ai.key_findings %}<li>{{ kf }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if ai.release_notes %}
+  <h3 style="margin:.75rem 0 .5rem; color:var(--muted); font-size:.8rem; text-transform:uppercase;">Release Notes</h3>
+  <div class="release-notes">{{ ai.release_notes }}</div>
+  {% endif %}
+</div>
+
+<!-- TICKETS -->
+{% if ai.tickets %}
+<div class="card section">
+  <h2>Tickets de Sécurité ({{ ai.tickets | length }})</h2>
+  {% for t in ai.tickets %}
+  <div class="ticket">
+    <div class="ticket-header">
+      <span class="badge badge-{{ t.severity }}">{{ t.severity | upper }}</span>
+      <span class="ticket-title">{{ t.title }}</span>
+      {% if t.category %}<span class="finding-svc">{{ t.category }}</span>{% endif %}
+    </div>
+    <div class="ticket-body">
+      <strong>Description:</strong> {{ t.description }}<br>
+      <strong>Remédiation:</strong> {{ t.remediation }}<br>
+      <strong>Effort:</strong> {{ t.effort }}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- ALL FINDINGS -->
+{% if all_findings %}
+<div class="card section">
+  <h2>Tous les Findings ({{ all_findings | length }})</h2>
+  {% for f in all_findings %}
+  <div class="finding finding-{{ f.severity }}">
+    <div class="finding-header">
+      <span class="badge badge-{{ f.severity }}">{{ f.severity | upper }}</span>
+      <span class="finding-svc">{{ f._service }}</span>
+      <span class="finding-title">{{ f.get('type', f.get('rule_id', f.get('cve_id', f.get('permission', '')))) }}</span>
+    </div>
+    <div class="finding-desc">{{ f.get('description', f.get('message', '')) }}</div>
+    {% if f.get('examples') %}
+    <div class="finding-desc mono" style="margin-top:.25rem">{{ f.examples[:2] | join(' | ') }}</div>
+    {% endif %}
+    {% if f.get('remediation') %}
+    <div class="finding-desc" style="margin-top:.25rem; color:#93c5fd">→ {{ f.remediation }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- PER-SERVICE DETAILS -->
+<div class="card section">
+  <h2>Détail par Service</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Score</th>
+        <th>Critical</th>
+        <th>High</th>
+        <th>Medium</th>
+        <th>Low</th>
+        <th>Durée</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for svc, data in scans.items() %}
+    {% if data is mapping %}
+    <tr>
+      <td><strong>{{ svc }}</strong></td>
+      <td>
+        {% set sc = data.get('summary', {}).get('score') if data.get('summary') is mapping else None %}
+        {% if sc is not none %}
+          <span style="color: {% if sc >= 80 %}#4ade80{% elif sc >= 50 %}#facc15{% else %}#f87171{% endif %}; font-weight:600">{{ sc }}</span>
+        {% else %}—{% endif %}
+      </td>
+      {% for sev in ['critical','high','medium','low'] %}
+      <td>{{ data.get('summary', {}).get(sev, 0) if data.get('summary') is mapping else '—' }}</td>
+      {% endfor %}
+      <td>{{ data.get('duration_seconds', '—') }}s</td>
+      <td style="color:var(--muted); font-size:.75rem">{{ data.get('message', '—') }}</td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- NETWORK DETAIL -->
+{% if scans.get('network') is mapping %}
+{% set net = scans.network %}
+{% if net.get('urls') %}
+<div class="card section">
+  <h2>Endpoints Réseau</h2>
+  {% if net.urls %}
+  <h3>URLs détectées ({{ net.urls | length }})</h3>
+  <div style="margin-bottom:1rem">
+    {% for url in net.urls[:20] %}
+    <div class="mono" style="font-size:.72rem; color:var(--muted); padding:.2rem 0">{{ url }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if net.get('ips') %}
+  <h3>IPs hardcodées</h3>
+  <div>{% for ip in net.ips %}<span class="badge badge-medium" style="margin:.15rem">{{ ip }}</span>{% endfor %}</div>
+  {% endif %}
+</div>
+{% endif %}
+{% endif %}
+
+<!-- PERMISSIONS DETAIL -->
+{% if scans.get('permissions') is mapping %}
+{% set perms = scans.permissions %}
+{% if perms.get('findings') %}
+<div class="card section">
+  <h2>Permissions Android ({{ perms.get('permissions_total', 0) }} déclarées)</h2>
+  <table>
+    <thead><tr><th>Permission</th><th>Sévérité</th><th>Description</th></tr></thead>
+    <tbody>
+    {% for f in perms.findings | sort(attribute='severity') %}
+    <tr>
+      <td class="mono">{{ f.get('short_name', '') }}</td>
+      <td><span class="badge badge-{{ f.severity }}">{{ f.severity | upper }}</span></td>
+      <td style="color:var(--muted); font-size:.78rem">{{ f.get('description','') }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- GITLEAKS DETAIL -->
+{% if scans.get('gitleaks') is mapping %}
+{% set gl = scans.gitleaks %}
+{% if gl.get('findings') %}
+<div class="card section">
+  <h2>Secrets Détectés (Gitleaks)</h2>
+  <table>
+    <thead><tr><th>Règle</th><th>Sévérité</th><th>Fichier</th><th>Secret (masqué)</th></tr></thead>
+    <tbody>
+    {% for f in gl.findings %}
+    <tr>
+      <td>{{ f.get('rule_id','') }}</td>
+      <td><span class="badge badge-{{ f.severity }}">{{ f.severity | upper }}</span></td>
+      <td class="mono">{{ f.get('file','') }}</td>
+      <td class="mono">{{ f.get('secret','****') }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- CVE DETAIL -->
+{% if scans.get('syft_grype') is mapping or scans.get('syft') is mapping %}
+{% set syft = scans.get('syft_grype', scans.get('syft', {})) %}
+{% if syft.get('findings') %}
+<div class="card section">
+  <h2>CVE Détectées ({{ syft.findings | length }})</h2>
+  <table>
+    <thead><tr><th>CVE</th><th>Sévérité</th><th>Package</th><th>Version</th><th>Fix</th><th>Description</th></tr></thead>
+    <tbody>
+    {% for f in syft.findings %}
+    <tr>
+      <td class="mono">{{ f.get('cve_id','') }}</td>
+      <td><span class="badge badge-{{ f.severity }}">{{ f.severity | upper }}</span></td>
+      <td>{{ f.get('package','') }}</td>
+      <td class="mono">{{ f.get('version','') }}</td>
+      <td class="mono" style="color:#4ade80">{{ f.get('fix_version','—') }}</td>
+      <td style="color:var(--muted); font-size:.75rem">{{ f.get('description','')[:100] }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endif %}
+
+<div class="footer">
+  MobSecOps Security Pipeline &bull; Généré le {{ generated_at }} &bull; Pipeline automatisé — ne pas utiliser seul comme décision de release
+</div>
+</body>
+</html>

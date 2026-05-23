@@ -1,0 +1,19 @@
+services:
+  service_network:
+    build: .
+    container_name: service_network
+    ports:
+      - "8007:8007"
+    volumes:
+      - apk_storage:/apk_storage
+      - .:/app
+    env_file: .env
+    networks:
+      - pipeline_net
+    restart: unless-stopped
+volumes:
+  apk_storage:
+    external: true
+networks:
+  pipeline_net:
+    external: true
